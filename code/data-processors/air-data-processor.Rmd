@@ -1,0 +1,467 @@
+---
+title: "Air Quality Data - PM2.5 FRM/FEM Mass - 88101 "
+author: "Fatemeh Kazemi"
+date: "02-27-2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+### This program:
+  (1) Downloads and cleans PM2.5 data measured by EPA
+      i. https://aqs.epa.gov/aqsweb/airdata/download_files.html#Daily
+  (2) Choose a subset of monitors on the basis of data availability
+      i. 4days - 9month- 4years
+  (3) Smooths data with 4df per year to fill small gaps
+      i.Does not smooth over more than 90 days of missing data
+      ii. Divides data into coherent pieces instead
+  (4) Calculates yearly average of PM2.5 by site and month
+      i. Require at least 350 values to compute yearly average from smoothed data
+  (5) Uses cross-walk files between Sites and Zipcodes to assign the measurements
+      from Sites to the Zipcodes in their x-mile bufferzone
+  (6) Merge it with CMS data (on NEU Cluster) to find the Sites which have
+      population living in their x-mile bufferzone
+      
+### Note:
+  1. In data merged with CMS, bufferzone is 6-mile unless pm25ified
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages}
+library(tidyverse)
+library(here)
+library(lubridate)
+```
+
+```{r Call Functions}
+source(here('code','data-processors','epa-air-data-download-function.R'))
+source(here('code','data-processors','air-data-processor-function.R'))
+source(here('code','data-processors','air-data-smooth-mvavg-function.R'))
+```
+
+```{r load data}
+dirUSSpatial <- 
+  'C:\\Users\\fkazem01\\Box\\Projects\\USA Spatial\\data\\processed\\'
+dirpm25 <- 
+  'C:\\Users\\fkazem01\\Box\\Projects\\PM Components\\data\\processed\\'
+load(paste0(dirUSSpatial,'state-region.RDa'))
+load(paste0(dirUSSpatial,'site-zip.RDa'))
+load(paste0(dirpm25,'aqs-sites.RDa'))
+```
+
+```{r EPA AQS Data Download}
+#Using EPA.AQS.download Function
+dt.pm25.raw <- EPA.AQS.download (period = "daily", Index = "88101",
+                        start = 1999, end = 2008)
+dt.pm25.raw$Parameter.Name <- "PM25"
+save(dt.pm25.raw, file = here('data', 'raw', 'pm25-raw.RDa'))
+#Monitor.ID: Site.ID-POC
+
+monitor.pm <- dt.pm25.raw %>% distinct(Monitor.ID) #1906
+site.pm <- dt.pm25.raw %>% distinct(Site.ID)#1540
+
+dt.pm25.raw %>% 
+  mutate(Year = year(Date)) %>% 
+  distinct(Site.ID, Year) %>% 
+  group_by(Year) %>% 
+  summarise(n = n())
+```
+
+```{r Air quality data Process}
+# Find sites with at least 4day, 9month and 4 year
+# Using Air.Daily.Process function
+dt.pm25.sel <- Air.Daily.Process(dt = dt.pm25.raw, d = 4, m = 9, y = 4)
+
+monitor.pm25 <- dt.pm25.sel %>% distinct(Monitor.ID) # 1906 > 1178
+site.pm25 <- dt.pm25.sel %>% distinct(Site.ID) # 1540 > 1039
+
+# POC: Parameter Occurrence Code ...
+# ... more than one instrument measured a component at one site
+# pick the POC(instrument) with larger number of measurements
+site.POC.larger <- dt.pm25.sel %>% 
+  group_by(Site.ID, POC) %>% 
+  summarise(n = n()) %>% 
+  group_by(Site.ID) %>% 
+  filter(n == max (n)) %>% 
+  select(Site.ID, POC)
+
+dt.pm25.sel <- merge(dt.pm25.sel, site.POC.larger) 
+monitor.pm25 <- dt.pm25.sel %>% distinct(Monitor.ID) # 1906 > 1178 > 1039
+site.pm25 <- dt.pm25.sel %>% distinct(Site.ID) # 1540 > 1039
+dt.pm25.sel$POC <- dt.pm25.sel$Monitor.ID <- NULL
+save(dt.pm25.sel, file = here('data', 'processed', 'pm25-selected.RDa'))
+```
+
+```{r Smoothing Data & Caluculating 1-yr mvavg for each month}
+dt.air <- dt.pm25.sel %>% 
+  rename(Parameter.Symbol = Parameter.Name,
+         Value = Arithmetic.Mean) %>% 
+  arrange(Site.ID, Parameter.Symbol, Date)
+
+site.para <- dt.air %>% 
+  distinct(Site.ID, Parameter.Symbol)
+
+#using smoothed.yr function
+smooth.out <- mapply(Smoothed.Year, 
+                     site.para$Site.ID, site.para$Parameter.Symbol, 0.99, 350)
+para.monthly <- data.frame(Site.ID=unlist(smooth.out[1,]),
+                           Parameter.Symbol=unlist(smooth.out[2,]),
+                           Date=unlist(smooth.out[3,]), 
+                           para.1yr=unlist(smooth.out[4,]))
+
+dt.pm25.1yr <- para.monthly %>% 
+  mutate(Year = floor(Date -0.01),
+         Month = round((Date - Year)*12)) %>% 
+  select(-Date) %>% 
+  pivot_wider(names_sort = T,
+              names_from = c(Parameter.Symbol),
+              values_from = c(para.1yr)) %>% 
+  arrange(Site.ID, Year, Month)
+
+save(dt.pm25.1yr, file = here('data', 'processed', 'pm25-1yr.RDa'))
+
+dt.site.pm25 <- dt.pm25.1yr %>% distinct(Site.ID) %>% 
+  merge(dt.aqs.sites) #1039
+save(dt.site.pm25, file = here('data', 'processed', 'site-pm25.RDa'))
+
+dt.site.pm25 %>% 
+  group_by(Location.Setting) %>% 
+  summarise(n = n())
+#Location.Setting  n
+#                  1			
+#RURAL	           178			
+#SUBURBAN	         441		
+#URBAN	           419
+
+dt.pm25.1yr %>% 
+  distinct(Site.ID, Year) %>% 
+  group_by(Site.ID) %>% 
+  summarise(n = n()) %>% filter(n > 4) %>% 
+  nrow() #1039: all  #951: with 4+ years
+
+check <- dt.pm25.1yr %>% 
+  group_by(Site.ID) %>% 
+  summarise(n = n()) %>% 
+  arrange(n)
+
+summary(check$n) # 25 to 109
+```
+
+```{r Zipcodes in x-mile bufferzone of Monitoring Sites}
+# remove components for now to make the dataset smaller
+dt.pm25 <- dt.pm25.1yr %>% 
+  select(Site.ID, Year, Month) %>% 
+  mutate(psuedo = 100)
+
+# joining zipcodes to monitoring sites
+dt.pm25 <- dt.pm25 %>% 
+  inner_join(dt.site.zip, by = c("Site.ID", "Year")) %>% 
+  arrange(Zip.Code, Year, Dist)
+
+# for each zipcode, pick the site with shorter distance to zipcode centroeid
+dt.site.dist.shorter <- dt.pm25 %>% 
+  group_by(Zip.Code, Year) %>% 
+  filter(Dist == min (Dist)) %>% 
+  arrange(Zip.Code, Year) %>% 
+  as.data.frame()
+
+# 6-mile bufferzone around monitoring site
+dt.pm25.site.zip.bz6 <- dt.site.dist.shorter %>% 
+  filter(Dist <= 6) %>% 
+  select(Zip.Code, Year, Month, Site.ID, psuedo)
+
+save(dt.pm25.site.zip.bz6, 
+     file = here('data', 'processed', 'pm25-site-zip-bz6.RDa'))
+write.csv(dt.pm25.site.zip.bz6, 
+          file = here('data', 'processed', 'pm25-site-zip-bz6.csv'),
+          row.names = F)
+
+# Count number of zipcodes and sites
+dt.pm25.site.zip.bz6 %>% distinct(Zip.Code) %>% nrow() #4348
+dt.pm25.site.zip.bz6 %>% distinct(Site.ID) %>% nrow() #322 > 274
+
+# 12-mile bufferzone around monitoring site
+dt.pm25.site.zip.bz12  <- dt.site.dist.shorter %>% 
+  filter(Dist <= 12) %>% 
+  select(Zip.Code, Year, Month, Site.ID, psuedo)
+
+save(dt.pm25.site.zip.bz12, 
+     file = here('data', 'processed', 'pm25-site-zip-bz12.RDa'))
+write.csv(dt.pm25.site.zip.bz12, 
+          file = here('data', 'processed', 'pm25-site-zip-bz12.csv'),
+          row.names = F)
+
+# Count number of zipcodes and sites
+dt.pm25.site.zip.bz12 %>% distinct(Zip.Code) %>% nrow() #8446
+dt.pm25.site.zip.bz12 %>% distinct(Site.ID) %>% nrow() #322 > 320
+
+# 24-mile bufferzone around monitoring site
+dt.pm25.site.zip.bz24  <- dt.site.dist.shorter %>% 
+  filter(Dist <= 24) %>% 
+  select(Zip.Code, Year, Month, Site.ID, psuedo)
+
+save(dt.pm25.site.zip.bz24, 
+     file = here('data', 'processed', 'pm25-site-zip-bz24.RDa'))
+write.csv(dt.pm25.site.zip.bz24, 
+          file = here('data', 'processed', 'pm25-site-zip-bz24.csv'),
+          row.names = F)
+
+# Count number of zipcodes and sites
+dt.pm25.site.zip.bz24 %>% distinct(Zip.Code) %>% nrow() #15778
+dt.pm25.site.zip.bz24 %>% distinct(Site.ID) %>% nrow() #322 > 321
+
+# pm25-site-zip-bz12.csv was uploaded on NEU Cluster to be merged with CMS data
+# It has 320 sites with 8446 zipcodes around them
+# 317 out of 320 sites have population living in their 12-mile bufferzone
+
+# pm25-site-zip-bz6.csv was uploaded on NEU Cluster to be merged with CMS data
+# 271 out of 274 sites have population living in their 6-mile bufferzone
+# We extended the bufferzone around these 271 sites to 12- and 24- miles too
+```
+
+```{r Post mergeing with CMS Data}
+dt.pm25.site.ndi <- read.csv(here('data', 'processed', 'site_pm25_ndi.csv')) %>% 
+  rename(Site.ID = Site_ID) %>% 
+  left_join(dt.aqs.sites.ii) %>% 
+  left_join(dt.site.carbon.method)
+# 317 out of 320 sites have population living in their 12-mile bufferzone
+
+summary(dt.pm25.site.ndi$Location.Setting) 
+fix(dt.pm25.site.ndi) # changed blanks to 'RURAL'
+
+save(dt.pm25.site.ndi, file = here('data', 'processed', 'pm25-site-ndi.RDa'))
+write.csv(dt.pm25.site.ndi, 
+          file = here('data', 'processed', 'pm25-site-ndi.csv'),
+          row.names = F)
+
+# TOT/TOR Method in different location.set
+dt.pm25.site.ndi %>% 
+  group_by(Location.Setting, Method) %>% 
+  summarise(n = n())
+
+# urban and suburban: TOT >> TOR
+# rural:              TOR >> TOT
+# improve sites only in rural
+
+dt.pm25.site.ndi %>% 
+  group_by(Location.Setting) %>% 
+  summarise(n = n())
+# urban 72
+# suburban 69
+# rural 176
+
+dt.pm25.site.ndi %>% 
+  group_by(Region.IV, Location.Setting) %>% 
+  summarise(n = n())
+#1	102			
+#2	68			
+#3	93			
+#4	54	
+
+
+dt.pm25.site.ndi.bz6 <- read.csv(here('data', 'processed', 'site_pm25_ndi_bz6.csv')) %>% 
+  rename(Site.ID = Site_ID) %>% 
+  left_join(dt.aqs.sites.ii) 
+
+dt.pm25.site.ndi.bz6 %>% 
+  group_by(Location.Setting) %>% 
+  summarise(n = n())
+```
+
+```{r - daily data for eligible sites}
+dt.pm25.daily <- dt.pm25.site.ndi %>% 
+  select(Site.ID) %>% 
+  merge(dt.pm25.sel)
+
+save(dt.pm25.daily, file = here('data', 'processed', 'pm25-daily.RDa'))
+```
+
+
+
+
+```{r Smoothing Data & Caluculating 1 to 5-yr mvavg for each month}
+cmp.sub <- c("CA", "CL", "NA", "NI", "NO3", "OC", 
+             "PB", "PM", "SE", "SI", "SO4", "V", "ZN")
+dt.air <- dt.pm25.daily %>% 
+  select(Site.ID, Date, cmp.sub) %>% 
+  pivot_longer(cols = cmp.sub,
+               names_to = "Parameter.Symbol",
+               values_to = "Value") %>% 
+  arrange(Site.ID, Parameter.Symbol, Date)
+
+site.para <- dt.air %>% 
+  distinct(Site.ID, Parameter.Symbol)
+
+#using smoothed.yr function
+# 5 years
+smooth.out <- mapply(Smoothed.Year, 
+                     site.para$Site.ID, site.para$Parameter.Symbol, 4.99, 1750)
+para.monthly <- data.frame(Site.ID=unlist(smooth.out[1,]),
+                           Parameter.Symbol=unlist(smooth.out[2,]),
+                           Date=unlist(smooth.out[3,]), 
+                           para.yr=unlist(smooth.out[4,]))
+
+dt.pm25.5yr <- para.monthly %>% 
+  mutate(Year = floor(Date -0.01),
+         Month = round((Date - Year)*12)) %>% 
+  select(-Date) %>% 
+  pivot_wider(names_sort = T,
+              names_from = c(Parameter.Symbol),
+              values_from = c(para.yr)) %>% 
+  arrange(Site.ID, Year, Month)
+
+save(dt.pm25.5yr, file = here('data', 'processed', 'pm25-sub-5yr.RDa'))
+
+
+# 4 years
+smooth.out <- mapply(Smoothed.Year, 
+                     site.para$Site.ID, site.para$Parameter.Symbol, 3.99, 1400)
+para.monthly <- data.frame(Site.ID=unlist(smooth.out[1,]),
+                           Parameter.Symbol=unlist(smooth.out[2,]),
+                           Date=unlist(smooth.out[3,]), 
+                           para.yr=unlist(smooth.out[4,]))
+
+dt.pm25.4yr <- para.monthly %>% 
+  mutate(Year = floor(Date -0.01),
+         Month = round((Date - Year)*12)) %>% 
+  select(-Date) %>% 
+  pivot_wider(names_sort = T,
+              names_from = c(Parameter.Symbol),
+              values_from = c(para.yr)) %>% 
+  arrange(Site.ID, Year, Month)
+
+save(dt.pm25.4yr, file = here('data', 'processed', 'pm25-sub-4yr.RDa'))
+
+dt.pm25.4yr.5yr <- dt.pm25.5yr %>% 
+  select(Site.ID, Year, Month) %>% 
+  inner_join(dt.pm25.4yr)
+
+save(dt.pm25.4yr.5yr, file = here('data', 'processed', 'pm25-sub-4yr-5yr.RDa'))
+
+# 3 years
+smooth.out <- mapply(Smoothed.Year, 
+                     site.para$Site.ID, site.para$Parameter.Symbol, 2.99, 1050)
+para.monthly <- data.frame(Site.ID=unlist(smooth.out[1,]),
+                           Parameter.Symbol=unlist(smooth.out[2,]),
+                           Date=unlist(smooth.out[3,]), 
+                           para.yr=unlist(smooth.out[4,]))
+
+dt.pm25.3yr <- para.monthly %>% 
+  mutate(Year = floor(Date -0.01),
+         Month = round((Date - Year)*12)) %>% 
+  select(-Date) %>% 
+  pivot_wider(names_sort = T,
+              names_from = c(Parameter.Symbol),
+              values_from = c(para.yr)) %>% 
+  arrange(Site.ID, Year, Month)
+
+save(dt.pm25.3yr, file = here('data', 'processed', 'pm25-sub-3yr.RDa'))
+
+dt.pm25.3yr.5yr <- dt.pm25.5yr %>% 
+  select(Site.ID, Year, Month) %>% 
+  inner_join(dt.pm25.3yr)
+
+save(dt.pm25.3yr.5yr, file = here('data', 'processed', 'pm25-sub-3yr-5yr.RDa'))
+
+# 2 years
+smooth.out <- mapply(Smoothed.Year, 
+                     site.para$Site.ID, site.para$Parameter.Symbol, 1.99, 700)
+para.monthly <- data.frame(Site.ID=unlist(smooth.out[1,]),
+                           Parameter.Symbol=unlist(smooth.out[2,]),
+                           Date=unlist(smooth.out[3,]), 
+                           para.yr=unlist(smooth.out[4,]))
+
+dt.pm25.2yr <- para.monthly %>% 
+  mutate(Year = floor(Date -0.01),
+         Month = round((Date - Year)*12)) %>% 
+  select(-Date) %>% 
+  pivot_wider(names_sort = T,
+              names_from = c(Parameter.Symbol),
+              values_from = c(para.yr)) %>% 
+  arrange(Site.ID, Year, Month)
+
+save(dt.pm25.2yr, file = here('data', 'processed', 'pm25-sub-2yr.RDa'))
+
+dt.pm25.2yr.5yr <- dt.pm25.5yr %>% 
+  select(Site.ID, Year, Month) %>% 
+  inner_join(dt.pm25.2yr)
+
+save(dt.pm25.2yr.5yr, file = here('data', 'processed', 'pm25-sub-2yr-5yr.RDa'))
+
+# 1 year
+smooth.out <- mapply(Smoothed.Year, 
+                     site.para$Site.ID, site.para$Parameter.Symbol, 0.99, 350)
+para.monthly <- data.frame(Site.ID=unlist(smooth.out[1,]),
+                           Parameter.Symbol=unlist(smooth.out[2,]),
+                           Date=unlist(smooth.out[3,]), 
+                           para.yr=unlist(smooth.out[4,]))
+
+dt.pm25.1yr <- para.monthly %>% 
+  mutate(Year = floor(Date -0.01),
+         Month = round((Date - Year)*12)) %>% 
+  select(-Date) %>% 
+  pivot_wider(names_sort = T,
+              names_from = c(Parameter.Symbol),
+              values_from = c(para.yr)) %>% 
+  arrange(Site.ID, Year, Month)
+
+save(dt.pm25.1yr, file = here('data', 'processed', 'pm25-sub-1yr.RDa'))
+
+dt.pm25.1yr.5yr <- dt.pm25.5yr %>% 
+  select(Site.ID, Year, Month) %>% 
+  inner_join(dt.pm25.1yr)
+
+save(dt.pm25.1yr.5yr, file = here('data', 'processed', 'pm25-sub-1yr-5yr.RDa'))
+
+dt.pm25.5yr %>% distinct(Site.ID, Year) %>% nrow() #263 -  820
+dt.pm25.4yr %>% distinct(Site.ID, Year) %>% nrow() #303 - 1128
+dt.pm25.3yr %>% distinct(Site.ID, Year) %>% nrow() #314 - 1442
+dt.pm25.2yr %>% distinct(Site.ID, Year) %>% nrow() #317 - 1745
+dt.pm25.1yr %>% distinct(Site.ID, Year) %>% nrow() #317 - 2074
+```
+
+```{r}
+load(here('data','processed', 'pm25-daily.RDa'))
+load(here('data','processed','pm25-site-ndi.RDa'))
+
+dt.pm25 <- dt.pm25.site.ndi %>% 
+  mutate(Loc.Set = ifelse(Location.Setting == "RURAL", "Rural", "Urban"),
+         Region = ifelse(Region.IV == 1, "W",
+                         ifelse(Region.IV == 2, "MW",
+                                ifelse(Region.IV == 3, "S", "NE")))) %>% 
+    select(Site.ID, Region, Loc.Set) %>% 
+  merge(dt.pm25.daily) %>% 
+  pivot_longer(AS:PM,
+               names_to = "Parameter",
+               values_to = "Value")
+
+table.region <- dt.pm25 %>% 
+  group_by(Parameter, Region) %>% 
+  summarise(Mean = sprintf("%0.2f", mean(Value*1000)),
+            STD = sprintf("%0.2f", sd(Value*1000)))
+
+table.urban <- dt.pm25 %>% 
+  group_by(Parameter, Loc.Set) %>% 
+  summarise(Mean = sprintf("%0.2f", mean(Value*1000)),
+            STD = sprintf("%0.2f", sd(Value*1000))) %>% 
+  rename(Region = Loc.Set)
+
+table <- dt.pm25 %>% 
+  group_by(Parameter) %>% 
+  summarise(Mean = sprintf("%0.2f", mean(Value*1000)),
+            STD = sprintf("%0.2f", sd(Value*1000))) %>% 
+  mutate(Region = "US") %>% 
+  as.data.frame() %>% 
+  add_row(table.region) %>% 
+  add_row(table.urban) %>% 
+  pivot_wider(names_from = c(Region),
+              values_from = c(Mean, STD))
+
+write.csv(table,
+          file = here('output','table', 'pm25-daily-summary.csv'),
+          row.names = F)
+  
+```
+
